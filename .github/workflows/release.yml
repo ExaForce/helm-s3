@@ -39,13 +39,6 @@ jobs:
           # Useful if you want to use not the latest tag for changelog.
           GORELEASER_PREVIOUS_TAG: ""
 
-  docker-images:
-    name: Build Docker images
-    uses: ./.github/workflows/reusable-docker-images.yml
-    secrets:
-      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
-
   test-install:
     name: Test plugin installation
     needs:
