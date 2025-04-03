@@ -167,6 +167,9 @@ func processS3Object(ctx context.Context, client *s3.S3, bucket string, obj *s3.
 		return
 	}
 
+	var metaOut *s3.HeadObjectOutput
+	var err error
+
 	maxRetries := 3
 	for attempt := 1; attempt <= maxRetries; attempt++ {
 		metaOut, err = client.HeadObjectWithContext(ctx, &s3.HeadObjectInput{
