@@ -167,13 +167,25 @@ func processS3Object(ctx context.Context, client *s3.S3, bucket string, obj *s3.
 		return
 	}
 
-	metaOut, err := client.HeadObjectWithContext(ctx, &s3.HeadObjectInput{
-		Bucket: aws.String(bucket),
-		Key:    obj.Key,
-	})
-	if err != nil {
-		log.Errorf("head s3 object %q: %s", key, err)
-		return
+	maxRetries := 3
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		metaOut, err = client.HeadObjectWithContext(ctx, &s3.HeadObjectInput{
+			Bucket: aws.String(bucket),
+			Key:    obj.Key,
+		})
+
+		if err == nil {
+			// Success, break out of the retry loop
+			break
+		}
+
+		if attempt < maxRetries {
+			log.Warnf("Attempt %d to head s3 object %q failed: %s. Retrying...", attempt, key, err)
+		} else {
+			// Final attempt failed
+			log.Errorf("head s3 object %q failed after %d attempts: %s", key, maxRetries, err)
+			return
+		}
 	}
 
 	reindexItem := ChartInfo{Filename: key}
