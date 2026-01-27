@@ -42,3 +42,37 @@ goreleaser build --snapshot --clean
 
 - Main branch: `master`
 - Current working branch: `exa-master`
+
+## Release Process
+
+**IMPORTANT**: Both the git tag AND `plugin.yaml` version must be updated for a release to work correctly.
+
+The install script (`hack/install.sh`) reads the version from `plugin.yaml` to determine which release to download from GitHub. If `plugin.yaml` version doesn't match the git tag, users will get the wrong version.
+
+### Steps to Release
+
+1. Update version in `plugin.yaml`:
+   ```yaml
+   version: "X.Y.Z"
+   ```
+
+2. Commit the change:
+   ```bash
+   git add plugin.yaml
+   git commit -m "release: Bump version to X.Y.Z"
+   ```
+
+3. Create and push the tag:
+   ```bash
+   git tag vX.Y.Z
+   git push origin exa-master
+   git push origin vX.Y.Z
+   ```
+
+4. GitHub Actions will automatically build and publish the release.
+
+## Configuration
+
+### Environment Variables
+
+- `HELM_S3_TRAVERSE_WORKERS` - Number of concurrent workers for S3 HEAD requests during reindex (default: 50)
