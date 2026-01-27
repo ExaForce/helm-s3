@@ -88,8 +88,8 @@ type Storage struct {
 
 // Traverse traverses all charts in the repository.
 func (s *Storage) Traverse(ctx context.Context, repoURI string) ([]ChartInfo, <-chan error) {
-	charts := make(chan ChartInfo)
-	errs := make(chan error)
+	charts := make(chan ChartInfo, 1000)
+	errs := make(chan error, 100)
 	var result []ChartInfo
 	go s.traverse(ctx, repoURI, charts, errs)
 	// Collect the results and handle errors
