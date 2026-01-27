@@ -86,8 +86,6 @@ type reindexAction struct {
 
 func (act *reindexAction) run(ctx context.Context) error {
 	start := time.Now()
-	log.Infof("Starting reindex for %s", start)
-	act.printer.Printf("[DEBUG] Starting reindex.\n")
 
 	repoEntry, err := helmutil.LookupRepoEntry(act.repoName)
 	if err != nil {
@@ -106,11 +104,7 @@ func (act *reindexAction) run(ctx context.Context) error {
 	builtIndex := make(chan *repo.IndexFile, len(items)/batchSize+1)
 	var wg sync.WaitGroup
 
-	act.printer.Printf("[DEBUG] Creating split indexes.\n")
-
-	// Process items in batches of 1000
-	log.Info("Processing items in batches of 1000")
-	log.Info("Total items: ", len(items))
+	log.Infof("processing %d charts", len(items))
 	for i := 0; i < len(items); i += batchSize {
 		end := i + batchSize
 		if end > len(items) {
@@ -143,12 +137,9 @@ func (act *reindexAction) run(ctx context.Context) error {
 		}(items[i:end])
 	}
 
-	log.Info("Waiting for all goroutines to finish")
-	// Wait for all goroutines to finish
 	wg.Wait()
 	close(builtIndex)
 
-	log.Info("Processing indexes")
 	// Merge the individual index files into a single index file
 	finalIndex := repo.NewIndexFile()
 	for idx := range builtIndex {
@@ -160,7 +151,6 @@ func (act *reindexAction) run(ctx context.Context) error {
 	if err := finalIndex.WriteFile(repoEntry.CacheFile(), helmutil.DefaultIndexFilePerm); err != nil {
 		return errors.WithMessage(err, "update local index")
 	}
-	log.Infof("Index file written to %s", repoEntry.CacheFile())
 
 	file, err := os.Open(repoEntry.CacheFile())
 	if err != nil {
@@ -191,6 +181,6 @@ func (act *reindexAction) run(ctx context.Context) error {
 	}
 
 	act.printer.Printf("Repository %s was successfully reindexed.\n", act.repoName)
-	log.Infof("Reindex done in %s", time.Since(start))
+	log.Infof("reindex completed: %d charts in %s", len(items), time.Since(start))
 	return nil
 }

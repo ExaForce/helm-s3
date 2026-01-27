@@ -93,7 +93,6 @@ func (s *Storage) Traverse(ctx context.Context, repoURI string) ([]ChartInfo, <-
 	var result []ChartInfo
 	go s.traverse(ctx, repoURI, charts, errs)
 	// Collect the results and handle errors
-	log.Info("collecting results")
 	for {
 		select {
 		case chart, ok := <-charts:
@@ -109,8 +108,6 @@ func (s *Storage) Traverse(ctx context.Context, repoURI string) ([]ChartInfo, <-
 			break
 		}
 	}
-
-	log.Info("collected results")
 
 	return result, errs
 }
@@ -155,7 +152,6 @@ func (s *Storage) traverse(ctx context.Context, repoURI string, items chan<- Cha
 	totalObjects := 0
 
 	for {
-		log.Info("listing objects")
 		listOut, err := client.ListObjectsV2WithContext(ctx, &s3.ListObjectsV2Input{
 			Bucket:            aws.String(bucket),
 			Prefix:            aws.String(prefixKey),
@@ -168,7 +164,7 @@ func (s *Storage) traverse(ctx context.Context, repoURI string, items chan<- Cha
 			return
 		}
 
-		log.Infof("listOut.Contents: %d", len(listOut.Contents))
+		log.Debugf("listed %d objects", len(listOut.Contents))
 		totalObjects += len(listOut.Contents)
 
 		// Send jobs to workers
@@ -182,7 +178,6 @@ func (s *Storage) traverse(ctx context.Context, repoURI string, items chan<- Cha
 
 		// Decide if need to load more objects.
 		if listOut.NextContinuationToken == nil {
-			log.Infof("all %d objects queued for processing", totalObjects)
 			break
 		}
 		continuationToken = listOut.NextContinuationToken
