@@ -1,8 +1,11 @@
 package awsutil
 
 import (
+	"net"
+	"net/http"
 	"net/url"
 	"os"
+	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials"
@@ -101,11 +104,29 @@ func Session(opts ...SessionOption) (*session.Session, error) {
 		disableSSL = true
 	}
 
+	// Custom HTTP client with higher connection limits for parallel requests.
+	// Go's default MaxIdleConnsPerHost is 2, which severely limits concurrency.
+	httpClient := &http.Client{
+		Transport: &http.Transport{
+			Proxy: http.ProxyFromEnvironment,
+			DialContext: (&net.Dialer{
+				Timeout:   30 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			MaxIdleConns:          200,
+			MaxIdleConnsPerHost:   100,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+		},
+	}
+
 	so := session.Options{
 		Config: aws.Config{
 			DisableSSL:       aws.Bool(disableSSL),
 			S3ForcePathStyle: aws.Bool(true),
 			Endpoint:         aws.String(os.Getenv(awsEndpoint)),
+			HTTPClient:       httpClient,
 		},
 		SharedConfigState:       session.SharedConfigEnable,
 		AssumeRoleTokenProvider: StderrTokenProvider,
