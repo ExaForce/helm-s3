@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -26,6 +27,14 @@ import (
 const (
 	// selects serverside encryption for bucket.
 	awsS3encryption = "AWS_S3_SSE"
+
+	// awsS3TraverseWorkers is the env var to configure the number of concurrent
+	// workers for traversing S3 objects during reindex.
+	awsS3TraverseWorkers = "HELM_S3_TRAVERSE_WORKERS"
+
+	// defaultTraverseWorkers is the default number of concurrent workers for
+	// HEAD requests during traverse.
+	defaultTraverseWorkers = 50
 
 	// s3MetadataSoftLimitBytes is application-specific soft limit
 	// for the number of bytes in S3 object metadata.
@@ -53,6 +62,23 @@ func getSSE() *string {
 		return nil
 	}
 	return &sse
+}
+
+// getTraverseWorkers returns the number of concurrent workers for S3 traverse.
+func getTraverseWorkers() int {
+	if v := os.Getenv(awsS3TraverseWorkers); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return defaultTraverseWorkers
+}
+
+// s3ObjectJob represents a job for the worker pool.
+type s3ObjectJob struct {
+	obj       *s3.Object
+	bucket    string
+	prefixKey string
 }
 
 // Storage provides an interface to work with AWS S3 objects by s3 protocol.
@@ -106,8 +132,27 @@ func (s *Storage) traverse(ctx context.Context, repoURI string, items chan<- Cha
 
 	client := s3.New(s.session)
 
-	var continuationToken *string
+	// Create worker pool
+	numWorkers := getTraverseWorkers()
+	log.Infof("using %d workers for S3 traverse", numWorkers)
+
+	jobs := make(chan s3ObjectJob, numWorkers*2)
 	var wg sync.WaitGroup
+
+	// Start workers
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for job := range jobs {
+				processS3Object(ctx, client, job.bucket, job.obj, items, job.prefixKey)
+			}
+		}(i)
+	}
+
+	// List objects and send jobs to workers
+	var continuationToken *string
+	totalObjects := 0
 
 	for {
 		log.Info("listing objects")
@@ -118,36 +163,40 @@ func (s *Storage) traverse(ctx context.Context, repoURI string, items chan<- Cha
 		})
 		if err != nil {
 			log.Errorf("list s3 objects: %s", err)
+			close(jobs)
+			wg.Wait()
 			return
 		}
 
-		log.Info("listOut.Contents: ", len(listOut.Contents))
+		log.Infof("listOut.Contents: %d", len(listOut.Contents))
+		totalObjects += len(listOut.Contents)
 
-		wg.Add(1)
-
-		go func() {
-			defer wg.Done()
-			// Process objects in parallel
-			for _, obj := range listOut.Contents {
-				processS3Object(ctx, client, bucket, obj, items, prefixKey)
-				log.Info("processing object: ", *obj.Key)
+		// Send jobs to workers
+		for _, obj := range listOut.Contents {
+			jobs <- s3ObjectJob{
+				obj:       obj,
+				bucket:    bucket,
+				prefixKey: prefixKey,
 			}
-		}()
+		}
 
 		// Decide if need to load more objects.
 		if listOut.NextContinuationToken == nil {
-			log.Info("all objects processed")
+			log.Infof("all %d objects queued for processing", totalObjects)
 			break
 		}
 		continuationToken = listOut.NextContinuationToken
 	}
+
+	// Close jobs channel and wait for workers to finish
+	close(jobs)
 	wg.Wait()
 
-	log.Info("traverse took: ", time.Since(start))
+	log.Infof("traverse took: %s", time.Since(start))
 }
 
 func processS3Object(ctx context.Context, client *s3.S3, bucket string, obj *s3.Object, items chan<- ChartInfo, prefixKey string) {
-	log.Info("processing object: ", *obj.Key)
+	log.Debug("processing object: ", *obj.Key)
 	// We need to make object key relative to repo root.
 	key := strings.TrimPrefix(*obj.Key, prefixKey)
 	// Additionally trim prefix slash if exists, because repos can be:

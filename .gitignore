@@ -8,3 +8,5 @@ coverage.txt
 
 .idea
 *.iml
+
+.claude
