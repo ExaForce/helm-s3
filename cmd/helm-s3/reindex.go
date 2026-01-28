@@ -6,11 +6,11 @@ import (
 	"context"
 	"io"
 	"os"
-	"sync"
 	"time"
 
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
+	"sigs.k8s.io/yaml"
 
 	"github.com/hypnoglow/helm-s3/internal/awss3"
 	"github.com/hypnoglow/helm-s3/internal/awsutil"
@@ -98,57 +98,127 @@ func (act *reindexAction) run(ctx context.Context) error {
 	}
 	storage := awss3.New(sess)
 
-	items, _ := storage.Traverse(ctx, repoEntry.URL())
-
-	// Use a buffered channel to handle the concurrent indexing
-	builtIndex := make(chan *repo.IndexFile, len(items)/batchSize+1)
-	var wg sync.WaitGroup
-
-	log.Infof("processing %d charts", len(items))
-	for i := 0; i < len(items); i += batchSize {
-		end := i + batchSize
-		if end > len(items) {
-			end = len(items)
+	// Step 1: Fetch current index from S3
+	log.Info("fetching current index from S3")
+	currentIndex := repo.NewIndexFile()
+	indexURI := helmutil.IndexFileURL(repoEntry.URL())
+	indexData, err := storage.FetchRaw(ctx, indexURI)
+	if err != nil {
+		if err == awss3.ErrObjectNotFound {
+			log.Info("no existing index found, will create new one")
+		} else {
+			return errors.Wrap(err, "fetch current index")
 		}
+	} else {
+		if err := yaml.Unmarshal(indexData, currentIndex); err != nil {
+			return errors.Wrap(err, "unmarshal current index")
+		}
+		log.Infof("loaded existing index with %d chart entries", len(currentIndex.Entries))
+	}
 
-		wg.Add(1)
-		go func(batch []awss3.ChartInfo) {
-			defer wg.Done()
-			idx := repo.NewIndexFile()
+	// Step 2: List all chart files from S3 (no HEAD requests)
+	log.Info("listing chart files from S3")
+	s3Files, err := storage.ListChartFiles(ctx, repoEntry.URL())
+	if err != nil {
+		return errors.Wrap(err, "list chart files")
+	}
 
-			for _, item := range batch {
-				baseURL := repoEntry.URL()
-				if act.relative {
-					baseURL = ""
+	// Build set of S3 files for quick lookup
+	s3FileSet := make(map[string]bool, len(s3Files))
+	for _, f := range s3Files {
+		s3FileSet[f] = true
+	}
+
+	// Step 3: Build set of files currently in index
+	indexFileSet := make(map[string]bool)
+	for _, versions := range currentIndex.Entries {
+		for _, cv := range versions {
+			for _, url := range cv.URLs {
+				// Extract filename from URL
+				filename := url
+				if idx := len(url) - 1; idx >= 0 {
+					for i := len(url) - 1; i >= 0; i-- {
+						if url[i] == '/' {
+							filename = url[i+1:]
+							break
+						}
+					}
 				}
+				indexFileSet[filename] = true
+			}
+		}
+	}
 
-				if act.verbose {
-					act.printer.Printf("[DEBUG] Adding %s to index.\n", item.Filename)
+	// Step 4: Find new charts (in S3 but not in index)
+	var newCharts []string
+	for _, f := range s3Files {
+		if !indexFileSet[f] {
+			newCharts = append(newCharts, f)
+		}
+	}
+	log.Infof("found %d new charts to add", len(newCharts))
+
+	// Step 5: Find deleted charts (in index but not in S3)
+	var deletedCharts []string
+	for filename := range indexFileSet {
+		if !s3FileSet[filename] {
+			deletedCharts = append(deletedCharts, filename)
+		}
+	}
+	log.Infof("found %d charts to remove (no longer in S3)", len(deletedCharts))
+
+	// Step 6: Remove deleted charts from index
+	for _, filename := range deletedCharts {
+		// Find and remove the entry
+		for name, versions := range currentIndex.Entries {
+			var remaining []*repo.ChartVersion
+			for _, cv := range versions {
+				keep := true
+				for _, url := range cv.URLs {
+					if len(url) >= len(filename) && url[len(url)-len(filename):] == filename {
+						keep = false
+						break
+					}
 				}
-
-				filename := escapeIfRelative(item.Filename, act.relative)
-
-				if err := idx.MustAdd(item.Meta.Value().(*chart.Metadata), filename, baseURL, item.Hash); err != nil {
-					act.printer.PrintErrf("[ERROR] failed to add chart to the index: %s", err)
+				if keep {
+					remaining = append(remaining, cv)
 				}
 			}
-
-			builtIndex <- idx
-		}(items[i:end])
+			if len(remaining) == 0 {
+				delete(currentIndex.Entries, name)
+			} else {
+				currentIndex.Entries[name] = remaining
+			}
+		}
 	}
 
-	wg.Wait()
-	close(builtIndex)
+	// Step 7: Fetch metadata for new charts only (HEAD requests)
+	for _, filename := range newCharts {
+		if act.verbose {
+			act.printer.Printf("[DEBUG] Fetching metadata for %s\n", filename)
+		}
 
-	// Merge the individual index files into a single index file
-	finalIndex := repo.NewIndexFile()
-	for idx := range builtIndex {
-		finalIndex.Merge(idx)
+		chartInfo, err := storage.GetChartInfo(ctx, repoEntry.URL(), filename)
+		if err != nil {
+			log.Warnf("failed to get chart info for %s: %s", filename, err)
+			continue
+		}
+
+		baseURL := repoEntry.URL()
+		if act.relative {
+			baseURL = ""
+		}
+
+		escapedFilename := escapeIfRelative(chartInfo.Filename, act.relative)
+		if err := currentIndex.MustAdd(chartInfo.Meta.Value().(*chart.Metadata), escapedFilename, baseURL, chartInfo.Hash); err != nil {
+			act.printer.PrintErrf("[ERROR] failed to add chart to the index: %s", err)
+		}
 	}
 
-	finalIndex.SortEntries()
+	currentIndex.SortEntries()
 
-	if err := finalIndex.WriteFile(repoEntry.CacheFile(), helmutil.DefaultIndexFilePerm); err != nil {
+	// Step 8: Write and upload index
+	if err := currentIndex.WriteFile(repoEntry.CacheFile(), helmutil.DefaultIndexFilePerm); err != nil {
 		return errors.WithMessage(err, "update local index")
 	}
 
@@ -158,13 +228,11 @@ func (act *reindexAction) run(ctx context.Context) error {
 	}
 	defer file.Close()
 
-	// Get the file size
 	stat, err := file.Stat()
 	if err != nil {
 		return errors.Wrap(err, "get file stats")
 	}
 
-	// Read the file into a byte slice
 	ra := make([]byte, stat.Size())
 	if _, err := bufio.NewReader(file).Read(ra); err != nil && err != io.EOF {
 		return errors.Wrap(err, "read index file")
@@ -180,7 +248,13 @@ func (act *reindexAction) run(ctx context.Context) error {
 		act.printer.Printf("[DEBUG] Dry run, not pushing index to the repository.\n")
 	}
 
+	totalCharts := 0
+	for _, versions := range currentIndex.Entries {
+		totalCharts += len(versions)
+	}
+
 	act.printer.Printf("Repository %s was successfully reindexed.\n", act.repoName)
-	log.Infof("reindex completed: %d charts in %s", len(items), time.Since(start))
+	log.Infof("reindex completed: %d total charts (%d added, %d removed) in %s",
+		totalCharts, len(newCharts), len(deletedCharts), time.Since(start))
 	return nil
 }

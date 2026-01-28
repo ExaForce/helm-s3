@@ -348,6 +348,114 @@ type ChartInfo struct {
 	Hash     string
 }
 
+// ListChartFiles returns a list of all .tgz chart filenames in the repository.
+// This only lists objects without fetching metadata (no HEAD requests).
+func (s *Storage) ListChartFiles(ctx context.Context, repoURI string) ([]string, error) {
+	bucket, prefixKey, err := parseURI(repoURI)
+	if err != nil {
+		return nil, err
+	}
+
+	client := s3.New(s.session)
+	var chartFiles []string
+	var continuationToken *string
+
+	for {
+		listOut, err := client.ListObjectsV2WithContext(ctx, &s3.ListObjectsV2Input{
+			Bucket:            aws.String(bucket),
+			Prefix:            aws.String(prefixKey),
+			ContinuationToken: continuationToken,
+			MaxKeys:           aws.Int64(1000),
+		})
+		if err != nil {
+			return nil, errors.Wrap(err, "list s3 objects")
+		}
+
+		for _, obj := range listOut.Contents {
+			key := strings.TrimPrefix(*obj.Key, prefixKey)
+			key = strings.TrimPrefix(key, "/")
+
+			// Skip subfolders and non-chart files
+			if strings.Contains(key, "/") || !strings.HasSuffix(key, ".tgz") {
+				continue
+			}
+			chartFiles = append(chartFiles, key)
+		}
+
+		if listOut.NextContinuationToken == nil {
+			break
+		}
+		continuationToken = listOut.NextContinuationToken
+	}
+
+	log.Infof("listed %d chart files from S3", len(chartFiles))
+	return chartFiles, nil
+}
+
+// GetChartInfo fetches metadata for a single chart file via HEAD request.
+func (s *Storage) GetChartInfo(ctx context.Context, repoURI, filename string) (*ChartInfo, error) {
+	bucket, prefixKey, err := parseURI(repoURI)
+	if err != nil {
+		return nil, err
+	}
+
+	client := s3.New(s.session)
+	fullKey := prefixKey + "/" + filename
+	if strings.HasSuffix(prefixKey, "/") {
+		fullKey = prefixKey + filename
+	}
+
+	metaOut, err := client.HeadObjectWithContext(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(fullKey),
+	})
+	if err != nil {
+		return nil, errors.Wrapf(err, "head s3 object %q", filename)
+	}
+
+	reindexItem := &ChartInfo{Filename: filename}
+
+	serializedChartMeta, hasMeta := metaOut.Metadata[strings.Title(metaChartMetadata)]
+	chartDigest, hasDigest := metaOut.Metadata[strings.Title(metaChartDigest)]
+
+	if !hasMeta || !hasDigest {
+		// No metadata - need to download the chart to extract it
+		objectOut, err := client.GetObjectWithContext(ctx, &s3.GetObjectInput{
+			Bucket: aws.String(bucket),
+			Key:    aws.String(fullKey),
+		})
+		if err != nil {
+			return nil, errors.Wrapf(err, "get s3 object %q", filename)
+		}
+
+		buf := &bytes.Buffer{}
+		tr := io.TeeReader(objectOut.Body, buf)
+
+		ch, err := helmutil.LoadArchive(tr)
+		objectOut.Body.Close()
+		if err != nil {
+			return nil, errors.Wrapf(err, "load archive %q", filename)
+		}
+
+		digest, err := helmutil.Digest(buf)
+		if err != nil {
+			return nil, errors.Wrapf(err, "get chart hash for %q", filename)
+		}
+
+		reindexItem.Meta = ch.Metadata()
+		reindexItem.Hash = digest
+	} else {
+		meta := helmutil.NewChartMetadata()
+		if err := meta.UnmarshalJSON([]byte(*serializedChartMeta)); err != nil {
+			return nil, errors.Wrapf(err, "unserialize chart meta for %q", filename)
+		}
+		reindexItem.Meta = meta
+		reindexItem.Hash = *chartDigest
+	}
+
+	return reindexItem, nil
+}
+
 // FetchRaw downloads the object from URI and returns it in the form of byte slice.
 // uri must be in the form of s3 protocol: s3://bucket-name/key[...].
 func (s *Storage) FetchRaw(ctx context.Context, uri string) ([]byte, error) {
