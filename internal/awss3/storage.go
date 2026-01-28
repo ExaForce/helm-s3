@@ -5,15 +5,9 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"net"
-	"net/http"
 	"net/url"
 	"os"
-	"strconv"
 	"strings"
-	"sync"
-	"sync/atomic"
-	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
@@ -31,18 +25,9 @@ const (
 	// selects serverside encryption for bucket.
 	awsS3encryption = "AWS_S3_SSE"
 
-	// awsS3TraverseWorkers is the env var to configure the number of concurrent
-	// workers for traversing S3 objects during reindex.
-	awsS3TraverseWorkers = "HELM_S3_TRAVERSE_WORKERS"
-
-	// defaultTraverseWorkers is the default number of concurrent workers for
-	// HEAD requests during traverse.
-	defaultTraverseWorkers = 50
-
 	// s3MetadataSoftLimitBytes is application-specific soft limit
 	// for the number of bytes in S3 object metadata.
 	s3MetadataSoftLimitBytes = 1900
-	localBase                = "/tmp/"
 )
 
 var (
@@ -51,25 +36,6 @@ var (
 
 	// ErrObjectNotFound signals that an object was not found.
 	ErrObjectNotFound = errors.New("object not found")
-
-	// highConcurrencyHTTPClient is a shared HTTP client for parallel S3 operations.
-	// Created once at package init to ensure connection reuse.
-	highConcurrencyHTTPClient = &http.Client{
-		Transport: &http.Transport{
-			Proxy: http.ProxyFromEnvironment,
-			DialContext: (&net.Dialer{
-				Timeout:   30 * time.Second,
-				KeepAlive: 30 * time.Second,
-			}).DialContext,
-			MaxIdleConns:          200,
-			MaxIdleConnsPerHost:   100,
-			MaxConnsPerHost:       100,
-			IdleConnTimeout:       90 * time.Second,
-			TLSHandshakeTimeout:   10 * time.Second,
-			ExpectContinueTimeout: 1 * time.Second,
-			ForceAttemptHTTP2:     false, // Disable HTTP/2 to ensure connection pooling works
-		},
-	}
 )
 
 // New returns a new Storage.
@@ -86,259 +52,9 @@ func getSSE() *string {
 	return &sse
 }
 
-// getTraverseWorkers returns the number of concurrent workers for S3 traverse.
-func getTraverseWorkers() int {
-	if v := os.Getenv(awsS3TraverseWorkers); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			return n
-		}
-	}
-	return defaultTraverseWorkers
-}
-
-
-// s3ObjectJob represents a job for the worker pool.
-type s3ObjectJob struct {
-	obj       *s3.Object
-	bucket    string
-	prefixKey string
-}
-
 // Storage provides an interface to work with AWS S3 objects by s3 protocol.
 type Storage struct {
 	session *session.Session
-}
-
-// Traverse traverses all charts in the repository.
-func (s *Storage) Traverse(ctx context.Context, repoURI string) ([]ChartInfo, <-chan error) {
-	charts := make(chan ChartInfo, 1000)
-	errs := make(chan error, 100)
-	var result []ChartInfo
-	go s.traverse(ctx, repoURI, charts, errs)
-	// Collect the results and handle errors
-	for {
-		select {
-		case chart, ok := <-charts:
-			if !ok {
-				charts = nil
-			} else {
-				result = append(result, chart)
-			}
-		}
-
-		// Exit the loop when both channels are closed
-		if charts == nil {
-			break
-		}
-	}
-
-	return result, errs
-}
-
-// traverse traverses all charts in the repository.
-// It writes an info item about every chart to items, and errors to errs.
-// It always closes both channels when returns.
-func (s *Storage) traverse(ctx context.Context, repoURI string, items chan<- ChartInfo, errs chan<- error) {
-	log.Info("traversing s3 bucket")
-	start := time.Now()
-	defer close(items)
-	defer close(errs)
-
-	bucket, prefixKey, err := parseURI(repoURI)
-	if err != nil {
-		log.Errorf("parse uri: %s", err)
-		return
-	}
-
-	// Create S3 client with high-concurrency HTTP client to enable parallel requests.
-	// The default Go HTTP transport limits to 2 connections per host.
-	// Using package-level client to ensure connection reuse across calls.
-	client := s3.New(s.session, aws.NewConfig().WithHTTPClient(highConcurrencyHTTPClient))
-
-	// Create worker pool
-	numWorkers := getTraverseWorkers()
-	log.Infof("using %d workers for S3 traverse", numWorkers)
-
-	jobs := make(chan s3ObjectJob, numWorkers*2)
-	var wg sync.WaitGroup
-	var processedCount int64
-	var inFlightCount int64
-
-	// Start progress logger
-	progressDone := make(chan struct{})
-	go func() {
-		ticker := time.NewTicker(5 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				count := atomic.LoadInt64(&processedCount)
-				inFlight := atomic.LoadInt64(&inFlightCount)
-				log.Infof("progress: %d charts processed, %d in-flight", count, inFlight)
-			case <-progressDone:
-				return
-			}
-		}
-	}()
-
-	// Start workers
-	for i := 0; i < numWorkers; i++ {
-		wg.Add(1)
-		go func(workerID int) {
-			defer wg.Done()
-			for job := range jobs {
-				processS3Object(ctx, client, job.bucket, job.obj, items, job.prefixKey, &inFlightCount)
-				atomic.AddInt64(&processedCount, 1)
-			}
-		}(i)
-	}
-
-	// List objects and send jobs to workers
-	var continuationToken *string
-	totalObjects := 0
-
-	for {
-		listOut, err := client.ListObjectsV2WithContext(ctx, &s3.ListObjectsV2Input{
-			Bucket:            aws.String(bucket),
-			Prefix:            aws.String(prefixKey),
-			ContinuationToken: continuationToken,
-		})
-		if err != nil {
-			log.Errorf("list s3 objects: %s", err)
-			close(jobs)
-			wg.Wait()
-			return
-		}
-
-		log.Debugf("listed %d objects", len(listOut.Contents))
-		totalObjects += len(listOut.Contents)
-
-		// Send jobs to workers
-		for _, obj := range listOut.Contents {
-			jobs <- s3ObjectJob{
-				obj:       obj,
-				bucket:    bucket,
-				prefixKey: prefixKey,
-			}
-		}
-
-		// Decide if need to load more objects.
-		if listOut.NextContinuationToken == nil {
-			break
-		}
-		continuationToken = listOut.NextContinuationToken
-	}
-
-	// Close jobs channel and wait for workers to finish
-	close(jobs)
-	wg.Wait()
-	close(progressDone)
-
-	log.Infof("traverse took: %s", time.Since(start))
-}
-
-func processS3Object(ctx context.Context, client *s3.S3, bucket string, obj *s3.Object, items chan<- ChartInfo, prefixKey string, inFlightCount *int64) {
-	log.Debug("processing object: ", *obj.Key)
-	// We need to make object key relative to repo root.
-	key := strings.TrimPrefix(*obj.Key, prefixKey)
-	// Additionally trim prefix slash if exists, because repos can be:
-	// s3://bucket/repo/subdir OR s3://bucket/repo/subdir/
-	key = strings.TrimPrefix(key, "/")
-
-	if strings.Contains(key, "/") {
-		// This is a subfolder. Ignore it, because chart repository
-		// is flat and cannot contain nested directories.
-		return
-	}
-
-	if !strings.HasSuffix(key, ".tgz") {
-		// Ignore any file that isn't a chart
-		// This could include index.yaml
-		// or any other kind of file that might be in the repo
-		return
-	}
-
-	var metaOut *s3.HeadObjectOutput
-	var err error
-
-	maxRetries := 3
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		atomic.AddInt64(inFlightCount, 1)
-		metaOut, err = client.HeadObjectWithContext(ctx, &s3.HeadObjectInput{
-			Bucket: aws.String(bucket),
-			Key:    obj.Key,
-		})
-		atomic.AddInt64(inFlightCount, -1)
-
-		if err == nil {
-			// Success, break out of the retry loop
-			break
-		}
-
-		if attempt < maxRetries {
-			log.Warnf("Attempt %d to head s3 object %q failed: %s. Retrying...", attempt, key, err)
-		} else {
-			// Final attempt failed
-			log.Errorf("head s3 object %q failed after %d attempts: %s", key, maxRetries, err)
-			return
-		}
-	}
-
-	reindexItem := ChartInfo{Filename: key}
-
-	serializedChartMeta, hasMeta := metaOut.Metadata[strings.Title(metaChartMetadata)]
-	chartDigest, hasDigest := metaOut.Metadata[strings.Title(metaChartDigest)]
-	if !hasMeta || !hasDigest {
-		// Some charts in the repository can have no metadata.
-		//
-		// This might happen in few cases:
-		// - Chart was uploaded manually, not using 'helm s3 push';
-		// - Chart was pushed before we started adding metadata to objects;
-		// - Chart metadata was too big to add to the S3 object metadata (see issues
-		//   https://github.com/hypnoglow/helm-s3/issues/120 and
-		//   https://github.com/hypnoglow/helm-s3/issues/112 )
-		//
-		// In this case we have to download the ch file itself.
-		objectOut, err := client.GetObjectWithContext(ctx, &s3.GetObjectInput{
-			Bucket: aws.String(bucket),
-			Key:    obj.Key,
-		})
-		if err != nil {
-			log.Errorf("get s3 object %q: %s", key, err)
-			return
-		}
-
-		buf := &bytes.Buffer{}
-		tr := io.TeeReader(objectOut.Body, buf)
-
-		ch, err := helmutil.LoadArchive(tr)
-		objectOut.Body.Close()
-		if err != nil {
-			log.Errorf("load archive from s3 object %q: %s", key, err)
-			return
-		}
-
-		digest, err := helmutil.Digest(buf)
-		if err != nil {
-			log.Errorf("get chart hash for %q: %s", key, err)
-			return
-		}
-
-		reindexItem.Meta = ch.Metadata()
-		reindexItem.Hash = digest
-	} else {
-		meta := helmutil.NewChartMetadata()
-		if err := meta.UnmarshalJSON([]byte(*serializedChartMeta)); err != nil {
-			log.Errorf("unserialize chart meta for %q: %s", key, err)
-			return
-		}
-
-		reindexItem.Meta = meta
-		reindexItem.Hash = *chartDigest
-	}
-
-	// process meta and hash
-	items <- reindexItem
 }
 
 // ChartInfo contains info about particular chart.
