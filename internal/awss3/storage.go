@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -135,6 +136,23 @@ func (s *Storage) traverse(ctx context.Context, repoURI string, items chan<- Cha
 
 	jobs := make(chan s3ObjectJob, numWorkers*2)
 	var wg sync.WaitGroup
+	var processedCount int64
+
+	// Start progress logger
+	progressDone := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				count := atomic.LoadInt64(&processedCount)
+				log.Infof("progress: %d charts processed", count)
+			case <-progressDone:
+				return
+			}
+		}
+	}()
 
 	// Start workers
 	for i := 0; i < numWorkers; i++ {
@@ -143,6 +161,7 @@ func (s *Storage) traverse(ctx context.Context, repoURI string, items chan<- Cha
 			defer wg.Done()
 			for job := range jobs {
 				processS3Object(ctx, client, job.bucket, job.obj, items, job.prefixKey)
+				atomic.AddInt64(&processedCount, 1)
 			}
 		}(i)
 	}
@@ -186,6 +205,7 @@ func (s *Storage) traverse(ctx context.Context, repoURI string, items chan<- Cha
 	// Close jobs channel and wait for workers to finish
 	close(jobs)
 	wg.Wait()
+	close(progressDone)
 
 	log.Infof("traverse took: %s", time.Since(start))
 }
