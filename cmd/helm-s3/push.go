@@ -242,7 +242,7 @@ func (act *pushAction) run(ctx context.Context) error {
 			}
 		}
 	} else {
-		act.printer.Printf("[DEBUG] Skipping reindex cause skipReindex is set to %b.\n", act.skipReindex)
+		act.printer.Printf("[DEBUG] Skipping reindex cause skipReindex is set to %t.\n", act.skipReindex)
 	}
 	act.printer.Printf("Successfully uploaded the chart to the repository.\n")
 	return nil

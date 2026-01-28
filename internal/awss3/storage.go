@@ -5,6 +5,8 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"strconv"
@@ -75,6 +77,26 @@ func getTraverseWorkers() int {
 	return defaultTraverseWorkers
 }
 
+// newHighConcurrencyHTTPClient creates an HTTP client optimized for parallel S3 requests.
+// Go's default MaxIdleConnsPerHost is 2, which severely limits concurrency.
+func newHighConcurrencyHTTPClient() *http.Client {
+	return &http.Client{
+		Transport: &http.Transport{
+			Proxy: http.ProxyFromEnvironment,
+			DialContext: (&net.Dialer{
+				Timeout:   30 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			MaxIdleConns:          200,
+			MaxIdleConnsPerHost:   100,
+			MaxConnsPerHost:       100,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+		},
+	}
+}
+
 // s3ObjectJob represents a job for the worker pool.
 type s3ObjectJob struct {
 	obj       *s3.Object
@@ -128,7 +150,9 @@ func (s *Storage) traverse(ctx context.Context, repoURI string, items chan<- Cha
 		return
 	}
 
-	client := s3.New(s.session)
+	// Create S3 client with high-concurrency HTTP client to enable parallel requests.
+	// The default Go HTTP transport limits to 2 connections per host.
+	client := s3.New(s.session, aws.NewConfig().WithHTTPClient(newHighConcurrencyHTTPClient()))
 
 	// Create worker pool
 	numWorkers := getTraverseWorkers()
