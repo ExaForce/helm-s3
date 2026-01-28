@@ -51,6 +51,25 @@ var (
 
 	// ErrObjectNotFound signals that an object was not found.
 	ErrObjectNotFound = errors.New("object not found")
+
+	// highConcurrencyHTTPClient is a shared HTTP client for parallel S3 operations.
+	// Created once at package init to ensure connection reuse.
+	highConcurrencyHTTPClient = &http.Client{
+		Transport: &http.Transport{
+			Proxy: http.ProxyFromEnvironment,
+			DialContext: (&net.Dialer{
+				Timeout:   30 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			MaxIdleConns:          200,
+			MaxIdleConnsPerHost:   100,
+			MaxConnsPerHost:       100,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+			ForceAttemptHTTP2:     false, // Disable HTTP/2 to ensure connection pooling works
+		},
+	}
 )
 
 // New returns a new Storage.
@@ -77,25 +96,6 @@ func getTraverseWorkers() int {
 	return defaultTraverseWorkers
 }
 
-// newHighConcurrencyHTTPClient creates an HTTP client optimized for parallel S3 requests.
-// Go's default MaxIdleConnsPerHost is 2, which severely limits concurrency.
-func newHighConcurrencyHTTPClient() *http.Client {
-	return &http.Client{
-		Transport: &http.Transport{
-			Proxy: http.ProxyFromEnvironment,
-			DialContext: (&net.Dialer{
-				Timeout:   30 * time.Second,
-				KeepAlive: 30 * time.Second,
-			}).DialContext,
-			MaxIdleConns:          200,
-			MaxIdleConnsPerHost:   100,
-			MaxConnsPerHost:       100,
-			IdleConnTimeout:       90 * time.Second,
-			TLSHandshakeTimeout:   10 * time.Second,
-			ExpectContinueTimeout: 1 * time.Second,
-		},
-	}
-}
 
 // s3ObjectJob represents a job for the worker pool.
 type s3ObjectJob struct {
@@ -152,7 +152,8 @@ func (s *Storage) traverse(ctx context.Context, repoURI string, items chan<- Cha
 
 	// Create S3 client with high-concurrency HTTP client to enable parallel requests.
 	// The default Go HTTP transport limits to 2 connections per host.
-	client := s3.New(s.session, aws.NewConfig().WithHTTPClient(newHighConcurrencyHTTPClient()))
+	// Using package-level client to ensure connection reuse across calls.
+	client := s3.New(s.session, aws.NewConfig().WithHTTPClient(highConcurrencyHTTPClient))
 
 	// Create worker pool
 	numWorkers := getTraverseWorkers()
