@@ -161,6 +161,7 @@ func (s *Storage) traverse(ctx context.Context, repoURI string, items chan<- Cha
 	jobs := make(chan s3ObjectJob, numWorkers*2)
 	var wg sync.WaitGroup
 	var processedCount int64
+	var inFlightCount int64
 
 	// Start progress logger
 	progressDone := make(chan struct{})
@@ -171,7 +172,8 @@ func (s *Storage) traverse(ctx context.Context, repoURI string, items chan<- Cha
 			select {
 			case <-ticker.C:
 				count := atomic.LoadInt64(&processedCount)
-				log.Infof("progress: %d charts processed", count)
+				inFlight := atomic.LoadInt64(&inFlightCount)
+				log.Infof("progress: %d charts processed, %d in-flight", count, inFlight)
 			case <-progressDone:
 				return
 			}
@@ -184,7 +186,7 @@ func (s *Storage) traverse(ctx context.Context, repoURI string, items chan<- Cha
 		go func(workerID int) {
 			defer wg.Done()
 			for job := range jobs {
-				processS3Object(ctx, client, job.bucket, job.obj, items, job.prefixKey)
+				processS3Object(ctx, client, job.bucket, job.obj, items, job.prefixKey, &inFlightCount)
 				atomic.AddInt64(&processedCount, 1)
 			}
 		}(i)
@@ -234,7 +236,7 @@ func (s *Storage) traverse(ctx context.Context, repoURI string, items chan<- Cha
 	log.Infof("traverse took: %s", time.Since(start))
 }
 
-func processS3Object(ctx context.Context, client *s3.S3, bucket string, obj *s3.Object, items chan<- ChartInfo, prefixKey string) {
+func processS3Object(ctx context.Context, client *s3.S3, bucket string, obj *s3.Object, items chan<- ChartInfo, prefixKey string, inFlightCount *int64) {
 	log.Debug("processing object: ", *obj.Key)
 	// We need to make object key relative to repo root.
 	key := strings.TrimPrefix(*obj.Key, prefixKey)
@@ -260,10 +262,12 @@ func processS3Object(ctx context.Context, client *s3.S3, bucket string, obj *s3.
 
 	maxRetries := 3
 	for attempt := 1; attempt <= maxRetries; attempt++ {
+		atomic.AddInt64(inFlightCount, 1)
 		metaOut, err = client.HeadObjectWithContext(ctx, &s3.HeadObjectInput{
 			Bucket: aws.String(bucket),
 			Key:    obj.Key,
 		})
+		atomic.AddInt64(inFlightCount, -1)
 
 		if err == nil {
 			// Success, break out of the retry loop
