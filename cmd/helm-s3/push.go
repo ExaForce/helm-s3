@@ -198,17 +198,18 @@ func (act *pushAction) run(ctx context.Context) error {
 		}
 	}
 
-	// The gap between index fetching and uploading should be as small as
-	// possible to make the best effort to avoid race conditions.
-	// See https://github.com/hypnoglow/helm-s3/issues/18 for more info.
-
-	// Fetch current index, update it and upload it back.
-
-	b, err := storage.FetchRaw(ctx, repoEntry.IndexURL())
-	if err != nil {
-		return errors.WithMessage(err, "fetch current repo index")
-	}
 	if !act.skipReindex {
+		// The gap between index fetching and uploading should be as small as
+		// possible to make the best effort to avoid race conditions.
+		// See https://github.com/hypnoglow/helm-s3/issues/18 for more info.
+
+		// Fetch current index, update it and upload it back.
+
+		b, err := storage.FetchRaw(ctx, repoEntry.IndexURL())
+		if err != nil {
+			return errors.WithMessage(err, "fetch current repo index")
+		}
+
 		idx := helmutil.NewIndex()
 		if err := idx.UnmarshalBinary(b); err != nil {
 			return errors.WithMessage(err, "load index from downloaded file")
